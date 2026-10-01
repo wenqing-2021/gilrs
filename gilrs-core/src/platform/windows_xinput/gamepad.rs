@@ -5,6 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use super::dinput::{DirectInput, Registry};
 use super::FfDevice;
 use crate::event_queue::{
     bounded, EnqueueResult, EventReceiver, EventSender, QueueItem, DEFAULT_EVENT_QUEUE_CAPACITY,
@@ -57,7 +58,8 @@ const MAX_XINPUT_CONTROLLERS: usize = 4;
 
 #[derive(Debug)]
 pub struct Gilrs {
-    gamepads: [Gamepad; MAX_XINPUT_CONTROLLERS],
+    gamepads: Vec<Gamepad>,
+    registry: Registry,
     rx: EventReceiver<Event>,
     control_tx: Option<SyncSender<Control>>,
     join_handle: Option<JoinHandle<()>>,
@@ -74,7 +76,9 @@ impl Gilrs {
         let gamepad_ids: [usize; MAX_XINPUT_CONTROLLERS] = std::array::from_fn(|idx| idx);
 
         // Map controller IDs to Gamepads
-        let gamepads = gamepad_ids.map(|id| Gamepad::new(id as u32, xinput_handle.clone()));
+        let gamepads = gamepad_ids
+            .map(|id| Gamepad::new(id as u32, xinput_handle.clone()))
+            .to_vec();
 
         let mut connected: [bool; MAX_XINPUT_CONTROLLERS] = Default::default();
 
@@ -85,12 +89,19 @@ impl Gilrs {
 
         let (tx, rx) = bounded(DEFAULT_EVENT_QUEUE_CAPACITY);
         let (control_tx, control_rx) = mpsc::sync_channel(1);
-        let (join_handle, completion) =
-            Self::spawn_thread(tx, connected, xinput_handle.clone(), control_rx)?;
+        let registry = Registry::default();
+        let (join_handle, completion) = Self::spawn_thread(
+            tx,
+            connected,
+            xinput_handle.clone(),
+            control_rx,
+            registry.clone(),
+        )?;
 
         // Coerce gamepads vector to slice
         Ok(Gilrs {
             gamepads,
+            registry,
             rx,
             control_tx: Some(control_tx),
             join_handle: Some(join_handle),
@@ -113,6 +124,7 @@ impl Gilrs {
     }
 
     fn handle_queue_item(&mut self, item: QueueItem<Event>) -> Event {
+        self.refresh_directinput();
         match item {
             QueueItem::Event(event) => event,
             QueueItem::Overflow { dropped } => {
@@ -142,10 +154,30 @@ impl Gilrs {
         control_tx
             .send(Control::Reset(ack_tx))
             .map_err(|_| ResetError::BackendUnavailable)?;
-        match ack_rx.recv_timeout(SHUTDOWN_TIMEOUT) {
+        let result = match ack_rx.recv_timeout(SHUTDOWN_TIMEOUT) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ResetError::TimedOut),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(ResetError::WorkerFailed),
+        };
+        self.refresh_directinput();
+        result
+    }
+
+    fn refresh_directinput(&mut self) {
+        let registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, metadata) in registry.iter().enumerate() {
+            let id = MAX_XINPUT_CONTROLLERS + index;
+            if id == self.gamepads.len() {
+                self.gamepads.push(Gamepad {
+                    id: id as u32,
+                    uuid: metadata.uuid,
+                    is_connected: false,
+                    xinput_handle: self.gamepads[0].xinput_handle.clone(),
+                    directinput: Some(metadata.clone()),
+                });
+            }
+            self.gamepads[id].uuid = metadata.uuid;
+            self.gamepads[id].directinput = Some(metadata.clone());
         }
     }
 
@@ -220,13 +252,25 @@ impl Gilrs {
         connected: [bool; MAX_XINPUT_CONTROLLERS],
         xinput_handle: Arc<XInputHandle>,
         control_rx: Receiver<Control>,
+        registry: Registry,
     ) -> Result<(JoinHandle<()>, Receiver<WorkerExit>), PlatformError> {
         let (completion_tx, completion) = mpsc::sync_channel(1);
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
         let join_handle = std::thread::Builder::new()
             .name("gilrs".to_owned())
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| unsafe {
-                    Self::run_worker(tx, connected, xinput_handle, control_rx)
+                    let mut directinput = match DirectInput::new(registry) {
+                        Ok(backend) => {
+                            let _ = startup_tx.send(true);
+                            backend
+                        }
+                        Err(_) => {
+                            let _ = startup_tx.send(false);
+                            return;
+                        }
+                    };
+                    Self::run_worker(tx, connected, xinput_handle, control_rx, &mut directinput)
                 }));
                 let exit = if result.is_ok() {
                     WorkerExit::Stopped
@@ -238,6 +282,11 @@ impl Gilrs {
             })
             .map_err(|error| PlatformError::Other(Box::new(error)))?;
 
+        if startup_rx.recv_timeout(SHUTDOWN_TIMEOUT) != Ok(true) {
+            return Err(PlatformError::Other(Box::new(std::io::Error::other(
+                "DirectInput background worker failed to initialize",
+            ))));
+        }
         Ok((join_handle, completion))
     }
 
@@ -246,6 +295,7 @@ impl Gilrs {
         connected: [bool; MAX_XINPUT_CONTROLLERS],
         xinput_handle: Arc<XInputHandle>,
         control_rx: Receiver<Control>,
+        directinput: &mut DirectInput,
     ) {
         // Issue #70 fix - Maintain a prev_state per controller id. Otherwise the loop will
         // compare the prev_state of a different controller.
@@ -253,7 +303,7 @@ impl Gilrs {
             [mem::zeroed::<XState>(); MAX_XINPUT_CONTROLLERS];
         let mut connected = connected;
         let mut counter = 0;
-        let mut force_snapshot = false;
+        let mut force_snapshot = true;
 
         loop {
             match control_rx.try_recv() {
@@ -261,11 +311,13 @@ impl Gilrs {
                 Ok(Control::Reset(ack)) => {
                     prev_states = [mem::zeroed::<XState>(); MAX_XINPUT_CONTROLLERS];
                     force_snapshot = true;
+                    directinput.reset();
                     let _ = ack.send(Ok(()));
                 }
                 Err(TryRecvError::Empty) => {}
             }
             let epoch = tx.epoch();
+            directinput.tick(&tx, epoch, force_snapshot);
             for id in 0..MAX_XINPUT_CONTROLLERS {
                 if force_snapshot
                     || *connected.get_unchecked(id)
@@ -273,7 +325,8 @@ impl Gilrs {
                 {
                     match xinput_handle.get_state(id as u32) {
                         Ok(XInputState { raw: state }) => {
-                            if !connected[id] {
+                            let newly_connected = !connected[id];
+                            if newly_connected || force_snapshot {
                                 connected[id] = true;
                                 Self::send_xinput_event(
                                     &tx,
@@ -283,6 +336,7 @@ impl Gilrs {
                             }
 
                             if force_snapshot
+                                || newly_connected
                                 || state.dwPacketNumber != prev_states[id].dwPacketNumber
                             {
                                 Self::compare_state(
@@ -291,12 +345,14 @@ impl Gilrs {
                                     &prev_states[id].Gamepad,
                                     &tx,
                                     epoch,
-                                    force_snapshot,
+                                    force_snapshot || newly_connected,
                                 );
                                 prev_states[id] = state;
                             }
                         }
-                        Err(XInputUsageError::DeviceNotConnected) if connected[id] => {
+                        Err(XInputUsageError::DeviceNotConnected)
+                            if connected[id] || force_snapshot =>
+                        {
                             connected[id] = false;
                             Self::send_xinput_event(
                                 &tx,
@@ -399,7 +455,7 @@ impl Gilrs {
                 Event::new(
                     id,
                     EventType::AxisValueChanged(
-                        g.sThumbLY as i32,
+                        y_axis_value(g.sThumbLY),
                         crate::native_ev_codes::AXIS_LSTICKY,
                     ),
                 ),
@@ -429,7 +485,7 @@ impl Gilrs {
                 Event::new(
                     id,
                     EventType::AxisValueChanged(
-                        g.sThumbRY as i32,
+                        y_axis_value(g.sThumbRY),
                         crate::native_ev_codes::AXIS_RSTICKY,
                     ),
                 ),
@@ -726,12 +782,13 @@ impl Drop for Gilrs {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Gamepad {
     uuid: Uuid,
     id: u32,
     is_connected: bool,
     xinput_handle: Arc<XInputHandle>,
+    directinput: Option<super::dinput::Metadata>,
 }
 
 impl Gamepad {
@@ -743,10 +800,14 @@ impl Gamepad {
             id,
             is_connected,
             xinput_handle,
+            directinput: None,
         }
     }
 
     pub fn name(&self) -> &str {
+        if let Some(metadata) = &self.directinput {
+            return &metadata.name;
+        }
         "Xbox Controller"
     }
 
@@ -755,10 +816,16 @@ impl Gamepad {
     }
 
     pub fn vendor_id(&self) -> Option<u16> {
+        if let Some(metadata) = &self.directinput {
+            return Some(metadata.vendor);
+        }
         None
     }
 
     pub fn product_id(&self) -> Option<u16> {
+        if let Some(metadata) = &self.directinput {
+            return Some(metadata.product);
+        }
         None
     }
 
@@ -767,6 +834,9 @@ impl Gamepad {
     }
 
     pub fn power_info(&self) -> PowerInfo {
+        if self.directinput.is_some() {
+            return PowerInfo::Unknown;
+        }
         match self.xinput_handle.get_gamepad_battery_information(self.id) {
             Ok(binfo) => match binfo.battery_type {
                 BatteryType::WIRED => PowerInfo::Wired,
@@ -799,22 +869,37 @@ impl Gamepad {
     }
 
     pub fn is_ff_supported(&self) -> bool {
+        if self.directinput.is_some() {
+            return false;
+        }
         true
     }
 
     pub fn ff_device(&self) -> Option<FfDevice> {
+        if self.directinput.is_some() {
+            return None;
+        }
         Some(FfDevice::new(self.id, self.xinput_handle.clone()))
     }
 
     pub fn buttons(&self) -> &[EvCode] {
+        if let Some(metadata) = &self.directinput {
+            return &metadata.buttons;
+        }
         &native_ev_codes::BUTTONS
     }
 
     pub fn axes(&self) -> &[EvCode] {
+        if let Some(metadata) = &self.directinput {
+            return &metadata.axes;
+        }
         &native_ev_codes::AXES
     }
 
     pub(crate) fn axis_info(&self, nec: EvCode) -> Option<&AxisInfo> {
+        if let Some(metadata) = &self.directinput {
+            return metadata.axis_info(nec);
+        }
         native_ev_codes::AXES_INFO
             .get(nec.0 as usize)
             .and_then(|o| o.as_ref())
@@ -826,16 +911,20 @@ fn is_mask_eq(l: u16, r: u16, mask: u16) -> bool {
     (l & mask != 0) == (r & mask != 0)
 }
 
+fn y_axis_value(value: i16) -> i32 {
+    super::dinput_state::xinput_y(value)
+}
+
 #[cfg(feature = "serde-serialize")]
 use serde::{Deserialize, Serialize};
 
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct EvCode(u8);
+pub struct EvCode(pub(super) u32);
 
 impl EvCode {
     pub fn into_u32(self) -> u32 {
-        self.0 as u32
+        self.0
     }
 }
 

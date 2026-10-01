@@ -44,7 +44,7 @@ fn main() {
         panic!(
             "Could not open gamecontrollerdb.txt {:?}. Did you forget to pull the \
              `SDL_GameControllerDB` submodule?",
-            &path
+            path
         )
     });
     let original_reader = BufReader::new(original_file);
